@@ -43,3 +43,37 @@ bash run.sh
 文件主线对应《TVMC 中文全译》第 4.3–4.7 节，以及《TVMC 新版流程说明》的登记、发行、两阶段批准、先筛查后归因与门限评分步骤。第一版聚焦完整文件样本。100 副本、2048 位、合谋与变换鲁棒性、API 申辩及 L3 飞地留待单独实验。
 
 模型下载、文件实验编排、独立核验与一键入口为本项目设计。`tvmc/` 中密码、证书、日志、流式交付、门限追踪和载体运算来自 ZhouJay798/TVMC_demo 的提交 4bf5995，已在本目录保存文件路径所需的实现。各角色共用进程和机器，密码部分使用研究实现和模拟身份，未实现物理隔离或可证明的安全擦除。归因结果指向副本来源。
+
+## 门限、签收与独立审计
+
+在项目根目录使用 Python 3.12。仅做协议验收可使用 CPU，新建环境并安装
+`cryptography==46.0.3`，执行：
+
+```bash
+python protocol_cases.py runs/protocol-001
+```
+
+使用新的输出目录。脚本用两个块的小文件检查两人意向、两份批准、重复批准、三人正常放行和请求重放；
+再检查缺块、乱序、正常签收、独立进程重验、修改签收文件及移除账本批准记录。
+查阅 cases.json 中的逐项结果和 delivery_audit.json。异常退出表示验收未完成。
+
+对真实模型，在项目数据盘目录使用已装 requirements.txt 的 GPU 环境：
+
+```bash
+python assets.py
+python stages/stage3_delivery.py runs/lora-delivery-001
+```
+
+阶段 3 完成后自动启动两个新进程。delivery_audit.json 记录门限与文件签收核验，
+verification.json 记录模型读回与归因核验，report.json 汇总本次运行。
+保存整个运行目录（包括 transit、received、journal.jsonl、trust.json），并将
+trust.sha256 经可信渠道另行保管。立即复核可使用：
+
+```bash
+python delivery_audit.py runs/lora-delivery-001 --trust-sha256 "$(cat /path/to/retained/trust.sha256)"
+```
+
+发行方与接收方均签署文件明文摘要和长度，因此能持有公开账本的各方也能比较文件摘要。
+审计读取实际密文、接收文件，验证证书、登记签名、检查点、请求与意向、不同批准者的签名及部分解密证明、回执。
+采用运行时私有 CA 与当前时间证书验证，原始 CRL 的有效期为 24 小时。
+旧版证据缺少交付胶囊和新版回执，完整交付审计需要本版本生成的证据。

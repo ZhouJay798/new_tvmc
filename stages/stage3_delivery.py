@@ -9,6 +9,7 @@ Also runs a negative control: the un-embedded owner model must FAIL screening.
 """
 import argparse
 import gc
+import subprocess
 import secrets
 import sys
 import time
@@ -21,6 +22,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from delivery_audit import independent, export_evidence
 from assets import MODEL, CORPUS, REPO, REVISION
 from files import pack, reader, save_json, save_rows
 from tvmc.crypto import digest
@@ -132,6 +134,10 @@ def run(out):
         print(f"  quality: PPL={quality['perplexity']:.2f} "
               f"({quality['perplexity']/owner_ppl:.3f}x) top1={quality['top1_agreement']:.4f}", flush=True)
 
+        if (stats["error"] != 0 or not quality["perplexity"] / owner_ppl <= PPL_BUDGET
+                or not quality["top1_agreement"] >= TOP1_BUDGET):
+            raise ValueError(f"Post-merge quality or fingerprint check failed for {cid}")
+
         # Enroll attribution codeword in tracer
         tracer.enroll(cid, word)
 
@@ -199,6 +205,9 @@ def run(out):
     print(f"  owner screen (negative control): {owner_matches}/16 matches "
           f"-> {'PASSES (BAD!)' if owner_passes else 'blocked (correct)'}", flush=True)
 
+    if not screen_passes or owner_passes:
+        raise ValueError("Screening controls failed before attribution disclosure")
+
     # ---- Tardos attribution on U1 ----
     print("\n=== Attribution ===", flush=True)
     tracer.commit_file(suspect)
@@ -218,6 +227,12 @@ def run(out):
                           custody.issuer_pk, custody.registry, custody.code_key)
     print(f"  judge_file: {'PASS' if verified else 'FAIL'}", flush=True)
 
+    anchor = export_evidence(out, custody, [1, 2, 3])
+    audit = independent(out, anchor)
+    verification = subprocess.check_output([sys.executable, str(ROOT / "verify.py"), str(out),
+                                            "--trust-sha256", anchor], text=True)
+    (out / "verification.json").write_text(verification)
+
     all_exact = all(r["exact"] for r in rows)
     all_passed = all(r["passed"] for r in rows)
 
@@ -227,7 +242,7 @@ def run(out):
         screen_matches=matches, screen_minimum=screening["minimum_matches"],
         screen_passes=screen_passes,
         owner_screen_matches=owner_matches, owner_screen_passes=owner_passes,
-        judge_verified=verified,
+        judge_verified=verified, delivery_audit_verified=audit["verified"],
         all_receipts_exact=all_exact,
         deliveries=[dict(cid=r["cid"], exact=r["exact"], error=r["error"],
                          ppl_ratio=round(r["ppl_ratio"], 4),

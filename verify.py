@@ -83,6 +83,10 @@ def verify_run(out, anchor):
         if recorded["size"] != received.stat().st_size or recorded["sha256"] != file_hash(received):
             raise ValueError(f"Received file differs from the witnessed record for {cid}")
         expected = dict(cid=cid, ciphertext_hash=manifest["ciphertext_hash"], received=True)
+        if "sha256" in manifest:
+            expected.update(sha256=recorded["sha256"], size=recorded["size"])
+            if any(expected[k] != manifest[k] for k in ("sha256", "size")):
+                raise ValueError("Sender and recipient file mismatch")
         if (manifest["recipient"] != i or signed["receipt"] != expected
                 or not verify(member_key(registry, i), "receipt", expected, signed["signature"])):
             raise ValueError(f"Invalid signed receipt for {cid}")

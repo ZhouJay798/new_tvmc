@@ -37,17 +37,19 @@ def issue_file(custody,recipient,path,directory,cid):
             data=src.read(CHUNK);h.update(data)
             encrypted=AESGCM(key).encrypt(j.to_bytes(12,'big'),data,canonical([cid,j,count,j==count-1]))
             target=directory/f'{j:08d}.bin';target.write_bytes(encrypted);chunks.append(str(target))
+    plain_hash=h.hexdigest()
     h.update(omega)
     package=dict(storage='files',chunks=chunks)
     ct_hash=ciphertext_digest(package)
     inner=hpke.seal(member_key(custody.registry,recipient,'receiving'),key+omega,cid.encode())
     cap=te.seal(custody.release_key,inner,[cid,ct_hash])
     codes=[e['body'] for e in custody.ledger.entries if e['kind']=='encrypted_codeword' and e['body']['cid']==cid]
-    msg=dict(cid=cid,recipient=recipient,registration=reg,commitment=h.hexdigest(),
+    msg=dict(sha256=plain_hash,size=Path(path).stat().st_size,cid=cid,recipient=recipient,registration=reg,commitment=h.hexdigest(),
              ciphertext_hash=ct_hash,capsule_hash=digest(cap),codebook_hash=digest(codes),release_kid=custody.release_key.kid)
     manifest=dict(message=msg,signature=sign(custody.issuer,'manifest',msg))
     import copy
     custody.manifests[cid]=copy.deepcopy(manifest);custody.ledger.append('manifest',manifest)
+    custody.ledger.append('delivery_capsule',dict(cid=cid,capsule=cap))
     package.update(manifest=manifest,capsule=cap)
     return package
 
@@ -69,11 +71,14 @@ def receive_file(custody,member,package,inner,target):
                 data=AESGCM(key).decrypt(j.to_bytes(12,'big'),Path(p).read_bytes(),canonical([cid,j,count,j==count-1]))
                 dest.write(data);h.update(data)
             dest.flush();os.fsync(dest.fileno())
+        plain_hash=h.hexdigest()
+        size=tmp.stat().st_size
+        if plain_hash!=msg['sha256'] or size!=msg['size']:raise ValueError('signed file mismatch')
         h.update(omega)
         if h.hexdigest()!=msg['commitment']:raise ValueError('plaintext commitment mismatch')
         os.replace(tmp,target)
     finally:
         if tmp.exists():tmp.unlink()
-    receipt=dict(cid=cid,ciphertext_hash=msg['ciphertext_hash'],received=True)
+    receipt=dict(sha256=plain_hash,size=size,cid=cid,ciphertext_hash=msg['ciphertext_hash'],received=True)
     custody.ledger.append('receipt',dict(receipt=receipt,signature=sign(member.identity,'receipt',receipt)))
     return target
