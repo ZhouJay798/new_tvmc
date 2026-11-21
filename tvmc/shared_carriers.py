@@ -67,7 +67,13 @@ class CarrierLab:
             if reference is not None:agree+=sum(a==b for a,b in zip(p,reference[j]))
         return dict(perplexity=math.exp(nll/count),tokens=count,top1_agreement=agree/count if reference is not None else None),predictions
 
-    def build(self,prompts,generic,bits=64,repeats=3,screen_bits=16,margin=3.,ridge=.1,seed=71):
+    def select_probes(self,prompts,generic,bits=64,repeats=3,screen_bits=16,seed=71):
+        """Pick the natural readout probes and the token pair each one measures.
+
+        Returns (probes, selected, assignments, rows, generic_keys, count, names).
+        The closed-form carrier and the low-rank writer share this selection, so
+        both experiment groups embed exactly the same probes.
+        """
         if self.owner is None:self.owner={n:m.weight.detach().clone() for n,m in self.modules.items()}
         total=bits+screen_bits;needed=total*repeats
         if len(prompts)<needed:raise ValueError('not enough distinct natural probes')
@@ -122,30 +128,36 @@ class CarrierLab:
                 rows[name].append((j,key,grad,float(score.detach())))
                 probes.append(dict(text=text,tokens=[a,b],bit=j//repeats,matrix=name))
                 if j%60==0:print(f'collect probe {j}/{needed}',flush=True)
-            edits={}
-            for name,items in rows.items():
-                keys=torch.cat(generic_keys.pop(name))
-                c=(keys.T@keys)/max(1,count)
-                K=torch.stack([x[1] for x in items]).T.double(); Grad=torch.stack([x[2] for x in items]).double()
-                C=c.double();nu=ridge*len(items)
-                system=K@K.T
-                system.add_(C,alpha=nu)
-                system.diagonal().add_(1e-5)
-                del C,c
-                Q=torch.linalg.solve(system,K)
-                del system
-                gram=Grad@Grad.T
-                gram.diagonal().add_(1e-6)
-                U=torch.linalg.solve(gram,Grad)
-                denominator=(K*Q).sum(0)*(Grad*U).sum(1)
-                if (denominator.abs()<1e-10).any():raise ValueError('degenerate carrier')
-                edits[name]=dict(q=Q.float(),u=U.float(),gain=(1/denominator).float(),
-                    scores=torch.tensor([x[3] for x in items],device=self.device),
-                    bits=torch.tensor([x[0]//repeats for x in items],device=self.device))
-            self.edits=edits;self.probes=probes;self.margin=margin;self.bits=bits;self.repeats=repeats;self.screen_bits=screen_bits
-            return probes
+            return probes,selected,assignments,rows,generic_keys,count,names
         finally:
             for h in handles:h.remove()
+
+    def build(self,prompts,generic,bits=64,repeats=3,screen_bits=16,margin=3.,ridge=.1,seed=71):
+        """Closed-form carrier (control group), built on the shared probe selection."""
+        probes,selected,assignments,rows,generic_keys,count,names=self.select_probes(
+            prompts,generic,bits,repeats,screen_bits,seed)
+        edits={}
+        for name,items in rows.items():
+            keys=torch.cat(generic_keys.pop(name))
+            c=(keys.T@keys)/max(1,count)
+            K=torch.stack([x[1] for x in items]).T.double(); Grad=torch.stack([x[2] for x in items]).double()
+            C=c.double();nu=ridge*len(items)
+            system=K@K.T
+            system.add_(C,alpha=nu)
+            system.diagonal().add_(1e-5)
+            del C,c
+            Q=torch.linalg.solve(system,K)
+            del system
+            gram=Grad@Grad.T
+            gram.diagonal().add_(1e-6)
+            U=torch.linalg.solve(gram,Grad)
+            denominator=(K*Q).sum(0)*(Grad*U).sum(1)
+            if (denominator.abs()<1e-10).any():raise ValueError('degenerate carrier')
+            edits[name]=dict(q=Q.float(),u=U.float(),gain=(1/denominator).float(),
+                scores=torch.tensor([x[3] for x in items],device=self.device),
+                bits=torch.tensor([x[0]//repeats for x in items],device=self.device))
+        self.edits=edits;self.probes=probes;self.margin=margin;self.bits=bits;self.repeats=repeats;self.screen_bits=screen_bits
+        return probes
 
     def apply(self,word,gain=1.):
         if len(word)!=self.bits+self.screen_bits:raise ValueError('bad code length')
