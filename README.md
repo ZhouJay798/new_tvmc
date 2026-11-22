@@ -77,3 +77,23 @@ python delivery_audit.py runs/lora-delivery-001 --trust-sha256 "$(cat /path/to/r
 审计读取实际密文、接收文件，验证证书、登记签名、检查点、请求与意向、不同批准者的签名及部分解密证明、回执。
 采用运行时私有 CA 与当前时间证书验证，原始 CRL 的有效期为 24 小时。
 旧版证据缺少交付胶囊和新版回执，完整交付审计需要本版本生成的证据。
+
+### Stage 4：Qwen2.5-1.5B-Instruct 指纹鲁棒性
+
+在项目根目录使用已有的、成功的 stage3_lora 交付证据（由
+`stages/stage3_delivery.py` 生成），以及相同的固定语料：
+```bash
+python stages/stage4_robustness.py runs/stage3 runs/stage4
+```
+第一个参数是包含 report.json、owner_model 和 received 的实际目录，第二个参数是新目录。
+若尚无证据，先按上文准备资产，再运行 `python stages/stage3_delivery.py runs/stage3`。
+
+三个签收副本分别从原文件独立加载。条件为无改动、算术问答指令微调
+（末层 down_proj，rank 16，48 步）、各线性层逐输出通道幅值剪枝 20%、
+对称 INT8 逐通道量化后反量化，以及普通文本的末块继续训练（48 步）。
+量化测量权重舍入的影响，推理仍为 FP32。实验不持久化改动权重。
+在独立 eval 切分的前 64 个文本块上对比 owner。每个条件写入 measurements.json，
+包括共有筛查、个体位存活/翻转/擦除、三个候选分数、筛查后的命中和质量。
+summary.json 按条件汇总三个副本，并记录 owner 阴性对照。
+离线评分使用零误码签收副本重建参考码字并核对原 U1 评分；
+结果用于鲁棒性比较，不生成新的门限审计证明。三个副本的计数不能外推为总体误判率。
