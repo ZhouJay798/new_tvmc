@@ -43,7 +43,7 @@ def disclosed(entries, group, checksum, release, registry):
     return opening["parameters"], disclosure["seq"]
 
 
-def verify_run(out, anchor):
+def verify_run(out, anchor, challenge=False):
     if file_hash(out / "trust.json") != anchor:
         raise ValueError("Trust digest mismatch")
     trust = json.loads((out / "trust.json").read_text())
@@ -60,7 +60,19 @@ def verify_run(out, anchor):
     if (not verify_checkpoint(checkpoint, issuer, registry, release.t) or not journal.check(head["chain"])
             or head["size"] != len(journal.entries) or head["root"] != root([leaf(canonical(e)) for e in journal.entries]).hex()):
         raise ValueError("Witness checkpoint mismatch")
-    artifact = out / "received/U1/model.zip"
+    artifact = out / ("challenge.zip" if challenge else "received/U1/model.zip")
+    expected = [1]
+    if challenge:
+        trial = unique(journal.entries, "robustness_challenge", lambda _: True)
+        opening = unique(journal.entries, "challenge_label_opening", lambda _: True)
+        result = unique(journal.entries, "trace_result", lambda _: True)
+        screen_commit = unique(journal.entries, "evidence_commitment", lambda b: b["group"] == "screen")
+        expected = [opening["body"]["recipient"]]
+        if (not trial["seq"] < screen_commit["seq"] < result["seq"] < opening["seq"]
+                or digest([expected[0], opening["body"]["salt"]]) != trial["body"]["label_commitment"]):
+            raise ValueError("Challenge label or ordering mismatch")
+        if expected[0] not in (1, 2, 3) or trial["body"]["sha256"] != file_hash(artifact):
+            raise ValueError("Challenge evidence mismatch")
     checksum = file_hash(artifact)
     screen, seq = disclosed(journal.entries, "screen", checksum, release, registry)
     observed = reader(screen, out)(artifact)
@@ -90,14 +102,15 @@ def verify_run(out, anchor):
         if (manifest["recipient"] != i or signed["receipt"] != expected
                 or not verify(member_key(registry, i), "receipt", expected, signed["signature"])):
             raise ValueError(f"Invalid signed receipt for {cid}")
-    return dict(verified=trace["recipients"] == [1], recipients=trace["recipients"], screen_matches=count)
+    return dict(verified=trace["recipients"] == expected, recipients=trace["recipients"], screen_matches=count)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
     parser.add_argument("--trust-sha256", required=True)
+    parser.add_argument("--challenge", action="store_true")
     args = parser.parse_args()
-    result = verify_run(args.output, args.trust_sha256)
+    result = verify_run(args.output, args.trust_sha256, args.challenge)
     print(json.dumps(result))
     raise SystemExit(0 if result["verified"] else 2)

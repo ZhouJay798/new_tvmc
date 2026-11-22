@@ -97,3 +97,5 @@ python stages/stage4_robustness.py runs/stage3 runs/stage4
 summary.json 按条件汇总三个副本，并记录 owner 阴性对照。
 离线评分使用零误码签收副本重建参考码字并核对原 U1 评分；
 结果用于鲁棒性比较，不生成新的门限审计证明。三个副本的计数不能外推为总体误判率。
+
+完整强度扫描、六条组合路径和新发行批次的变换文件归因，请参阅 [鲁棒性实验操作说明](ROBUSTNESS.md)。

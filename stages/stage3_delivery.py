@@ -50,7 +50,7 @@ PPL_BUDGET = 1.10
 TOP1_BUDGET = 0.85
 
 
-def run(out):
+def run(out, challenge=None):
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     ledger = Journal(out / "journal.jsonl")
@@ -58,7 +58,8 @@ def run(out):
 
     # ---- Model & data ----
     lab = LoRACarrierLab(MODEL, device="cuda:0")
-    train, generic, prompts, utility = split_corpus(CORPUS, (BITS + SCREEN_BITS) * REPEATS)
+    probe_seed = secrets.randbits(63) if challenge else 17
+    train, generic, prompts, utility = split_corpus(CORPUS, (BITS + SCREEN_BITS) * REPEATS, seed=probe_seed)
     texts = ordinary_splits(CORPUS)
 
     # ---- Owner training ----
@@ -187,6 +188,17 @@ def run(out):
     # ---- Shared-screen identification of U1 ----
     print("\n=== Screening ===", flush=True)
     suspect = out / "received/U1/model.zip"
+    recipient = 1
+    challenge_quality = True
+    if challenge:
+        from stages.stage4_matrix import make_challenge
+        recipient = secrets.randbelow(COPIES) + 1
+        suspect, details = make_challenge(out, recipient, challenge)
+        challenge_quality = details["quality_ok"]
+        blind_salt = secrets.token_hex(32)
+        ledger.append("robustness_challenge", dict(label_commitment=digest([recipient, blind_salt]), probe_seed=probe_seed,
+                      sha256=file_hash(suspect), **details))
+        save_json(out / "challenge.json", details)
     checksum = file_hash(suspect)
     ledger.append("evidence_commitment", dict(group="screen", file_sha256=checksum))
     screening = disclose_parameters(custody, "screen", screen_cap, QUORUM, checksum)
@@ -194,7 +206,7 @@ def run(out):
     observed = screen_read(suspect)
     matches = sum(a == b for a, b in zip(observed, screening["word"], strict=True))
     screen_passes = matches >= screening["minimum_matches"]
-    print(f"  U1 screen: {matches}/16 matches (min={screening['minimum_matches']}) "
+    print(f"  suspect screen: {matches}/16 matches (min={screening['minimum_matches']}) "
           f"-> {'PASS' if screen_passes else 'FAIL'}", flush=True)
     ledger.append("screen_result", dict(matches=matches, minimum=screening["minimum_matches"]))
 
@@ -206,6 +218,9 @@ def run(out):
           f"-> {'PASSES (BAD!)' if owner_passes else 'blocked (correct)'}", flush=True)
 
     if not screen_passes or owner_passes:
+        if challenge:
+            save_json(out / "challenge.json", dict(**details, recipient=recipient, screen_matches=matches,
+                      owner_matches=owner_matches, screened_out=not screen_passes, hits=[]))
         raise ValueError("Screening controls failed before attribution disclosure")
 
     # ---- Tardos attribution on U1 ----
@@ -217,7 +232,7 @@ def run(out):
     save_json(out / "trace.json", trace)
     print(f"  scores: { {k: round(v, 3) for k, v in trace['scores'].items()} }", flush=True)
     print(f"  hits: {trace['hits']}  recipients: {trace['recipients']}", flush=True)
-    attribution_ok = trace["recipients"] == [1]
+    attribution_ok = trace["recipients"] == [recipient]
 
     # ---- Public independent verification ----
     print("\n=== Verification ===", flush=True)
@@ -227,17 +242,23 @@ def run(out):
                           custody.issuer_pk, custody.registry, custody.code_key)
     print(f"  judge_file: {'PASS' if verified else 'FAIL'}", flush=True)
 
+    if challenge:
+        ledger.append("challenge_label_opening", dict(recipient=recipient, salt=blind_salt))
+        save_json(out / "challenge.json", dict(**details, recipient=recipient, screen_matches=matches,
+                  screened_out=False, hits=trace["hits"], scores=trace["scores"]))
     anchor = export_evidence(out, custody, [1, 2, 3])
     audit = independent(out, anchor)
-    verification = subprocess.check_output([sys.executable, str(ROOT / "verify.py"), str(out),
-                                            "--trust-sha256", anchor], text=True)
-    (out / "verification.json").write_text(verification)
+    verification = subprocess.run([sys.executable, str(ROOT / "verify.py"), str(out),
+                                            "--trust-sha256", anchor] + (["--challenge"] if challenge else []), text=True, stdout=subprocess.PIPE)
+    (out / "verification.json").write_text(verification.stdout)
+    if verification.returncode not in (0, 2):
+        verification.check_returncode()
 
     all_exact = all(r["exact"] for r in rows)
     all_passed = all(r["passed"] for r in rows)
 
     report = dict(
-        recipients=trace["recipients"], expected=[1],
+        recipients=trace["recipients"], expected=[recipient], challenge_quality=challenge_quality,
         attribution_ok=attribution_ok,
         screen_matches=matches, screen_minimum=screening["minimum_matches"],
         screen_passes=screen_passes,
@@ -248,7 +269,7 @@ def run(out):
                          ppl_ratio=round(r["ppl_ratio"], 4),
                          top1=round(r["top1_agreement"], 4), passed=r["passed"])
                     for r in rows],
-        passed=bool(attribution_ok and screen_passes and not owner_passes
+        passed=bool(verification.returncode == 0 and challenge_quality and attribution_ok and screen_passes and not owner_passes
                     and verified and all_exact and all_passed),
         seconds=time.monotonic() - started,
         gpu=torch.cuda.get_device_name(0),
@@ -259,9 +280,9 @@ def run(out):
     print(f"\n{'='*50}", flush=True)
     print(f"STAGE3 {'PASS' if report['passed'] else 'FAIL'}", flush=True)
     print(f"  receipts exact:  {all_exact} (3/3)", flush=True)
-    print(f"  U1 screen:       {matches}/16 (min 12) {'OK' if screen_passes else 'FAIL'}", flush=True)
+    print(f"  suspect screen:       {matches}/16 (min 12) {'OK' if screen_passes else 'FAIL'}", flush=True)
     print(f"  owner control:   {owner_matches}/16 {'BLOCKED (good)' if not owner_passes else 'PASSED (BAD)'}", flush=True)
-    print(f"  attribution:     {trace['recipients']} (expect [1]) {'OK' if attribution_ok else 'FAIL'}", flush=True)
+    print(f"  attribution:     {trace['recipients']} (expect [{recipient}]) {'OK' if attribution_ok else 'FAIL'}", flush=True)
     print(f"  judge_file:      {'PASS' if verified else 'FAIL'}", flush=True)
     return report
 
@@ -269,10 +290,22 @@ def run(out):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    out = parser.parse_args().output
+    parser.add_argument("--challenge", metavar="CASE")
+    parser.add_argument("--sft", type=Path)
+    parser.add_argument("--cpt", type=Path)
+    parser.add_argument("--sft-tokens", type=int, default=50000)
+    parser.add_argument("--seed", type=int, default=17)
+    args = parser.parse_args()
+    if args.challenge:
+        from stages.stage4_matrix import scenarios
+        if args.challenge not in scenarios() or args.sft_tokens < 1:
+            parser.error("invalid challenge or SFT budget")
+        if any(s.startswith(("sft-", "data")) for s in scenarios()[args.challenge]) and not args.sft:
+            parser.error("SFT challenge requires --sft")
+    out = args.output
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:
-        report = run(out)
+        report = run(out, args if args.challenge else None)
     except Exception as error:
         save_json(out / "report.json", dict(passed=False, error=str(error)))
         raise

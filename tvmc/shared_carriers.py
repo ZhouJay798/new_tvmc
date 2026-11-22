@@ -184,7 +184,7 @@ class CarrierLab:
         self.model.save_pretrained(path,safe_serialization=True);self.tokenizer.save_pretrained(path)
 
 
-def split_corpus(path,needed):
+def split_corpus(path,needed,seed=17):
     text=Path(path).read_text();N=len(text)
     def chunks(lo,hi,width=200):
         part=text[int(N*lo):int(N*hi)]
@@ -192,5 +192,5 @@ def split_corpus(path,needed):
     train=chunks(0,.25);generic=chunks(.25,.4);pool=chunks(.4,.75,100);utility=chunks(.8,.95)
     if len(pool)<needed:raise ValueError('corpus too small')
     # Distinct raw natural prefixes; keep disjoint source intervals.
-    probes=[pool[i] for i in np.random.default_rng(17).choice(len(pool),needed,replace=False)]
+    probes=[pool[i] for i in np.random.default_rng(seed).choice(len(pool),needed,replace=False)]
     return train,generic[:32],probes,utility[:16]

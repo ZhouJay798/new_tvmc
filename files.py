@@ -5,7 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile, ZIP_STORED
 
-from tvmc.shared_carriers import CarrierLab
+from tvmc.robust_transforms import EvaluationModel
 
 
 def save_json(path, value):
@@ -33,7 +33,7 @@ def reader(parameters, scratch):
                 if Path(name).name != name or name.startswith("."):
                     raise ValueError("Invalid model archive member")
             archive.extractall(temp)
-            lab = CarrierLab(temp, device="cuda:0", read_only=True)
+            lab = EvaluationModel(Path(temp))
             lab.repeats = parameters["repeats"]
             word, _ = lab.read(parameters["probes"], delta=parameters.get("delta", 1.0))
             return word.tolist()
