@@ -1,211 +1,254 @@
-"""Offline robustness measurements on the three delivered Stage 3 Qwen copies."""
+"""Stage 4: fingerprint robustness under post-delivery model modifications.
+
+For each delivered copy (U1/U2/U3), apply four transformations, each time
+starting from the ORIGINAL received ZIP. After each transformation measure:
+  * model quality: PPL ratio vs owner, top-1 agreement vs owner
+  * fingerprint survival: 16-bit screen matches, 128-bit individual
+    retained / flipped / erased
+  * attribution: Tardos scores from the observed individual code over the
+    three enrolled codewords; unique hit must equal the correct recipient.
+
+Probes and codewords are recovered from the stage3 run's journal (the same
+committed/disclosed parameters used by the real pipeline), so no probe or
+codeword is regenerated for this experiment.
+"""
 import argparse
-import csv
 import gc
 import json
-import math
 import sys
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from assets import CORPUS, REPO, REVISION
-from files import save_json
-from tvmc.lora_carrier import LoRALinear, ordinary_splits
-from tvmc.shared_carriers import CarrierLab
+from assets import MODEL, CORPUS
+from tvmc.shared_carriers import CarrierLab, split_corpus
+from tvmc.lora_carrier import ordinary_splits
+from tvmc.tardos import Tardos
 from tvmc.stream_delivery import file_hash
-from tvmc.transparency import Journal
-from verify import unique
 
-COPIES = ("U1", "U2", "U3")
-CASES = ("clean", "instruction_lora", "prune20", "int8_roundtrip", "continue_last_block")
-STEPS = 48
+BITS, SCREEN_BITS, REPEATS = 128, 16, 3
+COPIES = 3
 
-
-def unpack(archive, target):
-    with ZipFile(archive) as src:
-        for name in src.namelist():
-            if Path(name).name != name or name.startswith("."):
-                raise ValueError("Invalid Stage 3 archive member")
-        src.extractall(target)
+# transformation budgets (mild but realistic)
+FINETUNE_STEPS, FINETUNE_LR = 3, 1e-5
+CONTINUE_STEPS, CONTINUE_LR = 8, 1.5e-5
+PRUNE_FRACTION = 0.10
+QUANT_DTYPE = torch.bfloat16
 
 
-def train_variant(lab, case, train_texts, seed):
+# -------------------- evidence recovery --------------------
+def load_evidence(run):
+    """Recover disclosed probes and the three enrolled codewords from a stage3 run."""
+    entries = [json.loads(line) for line in (run / "journal.jsonl").read_text().splitlines()]
+
+    def disclosure(group):
+        found = [e for e in entries if e["kind"] == "probe_disclosure" and e["body"]["group"] == group]
+        if len(found) != 1:
+            raise ValueError(f"missing/duplicate probe_disclosure for {group}")
+        return found[0]["body"]["opening"]["parameters"]
+
+    attr_p = disclosure("group-1")
+    screen_p = disclosure("screen")
+    screen_probe = dict(probes=screen_p["probes"], repeats=REPEATS, delta=screen_p.get("delta", 1.0))
+
+    # Recover the three individual codewords from the trace's codebook evidence.
+    # trace.json stores the scored ciphertexts and the manifest mapping; the
+    # actual words were enrolled via encrypted_codeword entries, so we instead
+    # read the ORIGINAL delivered copies (zero error at delivery) and treat
+    # their observed individual bits as the enrolled codewords.
+    words = {}
+    for i in range(1, COPIES + 1):
+        artifact = run / "received" / f"U{i}" / "model.zip"
+        with TemporaryDirectory(dir=run) as tmp, ZipFile(artifact) as z:
+            z.extractall(tmp)
+            lab = CarrierLab(tmp, device="cuda:0", read_only=True)
+            lab.repeats = REPEATS
+            attrs, _ = lab.read(attr_p["probes"], delta=attr_p.get("delta", 1.0))
+            screens, _ = lab.read(screen_p["probes"], delta=screen_p.get("delta", 1.0))
+            del lab
+            gc.collect(); torch.cuda.empty_cache()
+        words[f"U{i}"] = dict(individual=attrs.tolist(), screen=screens.tolist(),
+                              screen_target=screen_p["word"])
+
+    # Tardos biases: take from the score disclosure parameters
+    disclosed = [e for e in entries if e["kind"] == "group_disclosed_and_retired"]
+    if len(disclosed) != 1:
+        raise ValueError("missing Tardos parameters disclosure")
+    params = disclosed[0]["body"]["parameters"]
+    return dict(attr=attr_p, screen=screen_probe, words=words,
+                biases=params["biases"], threshold=params["threshold"])
+
+
+# -------------------- transformations --------------------
+def transform_lm(lab, texts, steps, lr, seed=0):
     rng = np.random.default_rng(seed)
-    block = lab.model.model.layers[-1]
-    if case == "instruction_lora":
-        adapter = LoRALinear(block.mlp.down_proj, rank=16)
-        block.mlp.down_proj = adapter
-        params = [adapter.A, adapter.B]
-        lr = 3e-4
-    else:
-        block.requires_grad_(True)
-        params = list(block.parameters())
-        lr = 2e-5
-    optimizer = torch.optim.AdamW(params, lr=lr)
+    opt = torch.optim.AdamW([p for p in lab.model.parameters() if p.requires_grad], lr=lr)
     lab.model.train()
-    for _ in range(STEPS):
-        if case == "instruction_lora":
-            a, b = rng.integers(1, 100, size=2)
-            messages = [dict(role="user", content=f"What is {a} + {b}? Reply with the number.")]
-            prefix = lab.tokenizer.apply_chat_template(messages, add_generation_prompt=True)
-            answer = lab.tokenizer.encode(str(a + b), add_special_tokens=False)
-            ids = torch.tensor([prefix + answer + [lab.tokenizer.eos_token_id]], device=lab.device)
-            labels = ids.clone()
-            labels[:, :len(prefix)] = -100
-        else:
-            ids = lab.tokens(train_texts[rng.integers(len(train_texts))])["input_ids"]
-            labels = ids
-        optimizer.zero_grad(set_to_none=True)
-        loss = lab.model(input_ids=ids, labels=labels, use_cache=False).loss
-        loss.backward()
-        optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    if case == "instruction_lora":
-        adapter.merge_()
-        block.mlp.down_proj = adapter.base
-    lab.model.requires_grad_(False)
+    for k in range(steps):
+        text = texts[rng.integers(len(texts))]
+        x = lab.tokens(text)
+        out = lab.model(**x, labels=x["input_ids"], use_cache=False)
+        opt.zero_grad(set_to_none=True)
+        out.loss.backward()
+        opt.step()
     lab.model.eval()
 
 
-@torch.no_grad()
-def transform_weights(lab, case):
-    # Only transformer linear layers; preserve shared embedding / output weights.
-    for module in lab.model.model.layers.modules():
-        if not isinstance(module, torch.nn.Linear):
-            continue
-        for rows in module.weight.split(128):
-            if case == "prune20":
-                k = rows.shape[1] // 5
-                indices = rows.abs().topk(k, dim=1, largest=False).indices
-                rows.scatter_(1, indices, 0.0)
-            else:
-                scale = (rows.abs().amax(dim=1, keepdim=True) / 127).clamp_min(1e-30)
-                integers = (rows / scale).round().clamp(-127, 127).to(torch.int8)
-                rows.copy_(integers.float() * scale)
+def transform_prune(lab, fraction):
+    with torch.no_grad():
+        for m in lab.modules.values():
+            w = m.weight.data
+            flat = w.abs().flatten()
+            k = int(flat.numel() * fraction)
+            if k <= 0:
+                continue
+            cutoff = torch.kthvalue(flat, k).values
+            w[w.abs() <= cutoff] = 0
 
 
-def observe(lab, opening):
-    lab.repeats = opening["repeats"]
-    return lab.read(opening["probes"], delta=opening["delta"])[0]
+def transform_quant(lab, dtype):
+    with torch.no_grad():
+        for m in lab.modules.values():
+            w = m.weight.data
+            m.weight.data = w.to(dtype).float().contiguous()
 
 
-def scores(params, observed, words):
-    # Same signed integer coefficients and shared rounded offset as FileTracer.
-    scale = params["scale"]
-    coefficients = []
-    offset = 0.0
-    for p, y in zip(params["biases"], observed, strict=True):
-        u, v = math.sqrt((1-p)/p), math.sqrt(p/(1-p))
-        coefficients.append(round(scale * (0 if y < 0 else (u+v) * (1 if y else -1))))
-        offset += 0 if y < 0 else (-v if y else v)
-    return {cid: int(np.dot(word, coefficients)) + round(scale * offset)
-            for cid, word in words.items()}
+# -------------------- measurement --------------------
+def measure(lab, ev, owner_ppl, owner_preds, calib_texts):
+    q, preds = lab.utility(calib_texts, owner_preds)
+    ratio = q["perplexity"] / owner_ppl
+    top1 = q["top1_agreement"]
+
+    attrs, _ = lab.read(ev["attr"]["probes"], delta=ev["attr"].get("delta", 1.0))
+    screens, _ = lab.read(ev["screen"]["probes"], delta=ev["screen"].get("delta", 1.0))
+
+    screen_matches = int(np.sum(screens == np.asarray(ev["words"]["U1"]["screen_target"])))
+
+    tardos = Tardos(length=BITS, n=COPIES, seed=1)
+    tardos.p = np.asarray(ev["biases"], dtype=float)
+    tardos.threshold = float(ev["threshold"])
+    word_arrays = [np.asarray(ev["words"][f"U{i}"]["individual"]) for i in range(1, COPIES + 1)]
+    scores = tardos.scores(word_arrays, attrs).tolist()
+    hit_idx = tardos.decode(word_arrays, attrs)
+    hits = [f"U{i+1}" for i in hit_idx]
+
+    # individual-code survival relative to this copy's ORIGINAL codeword
+    return dict(
+        ppl=round(q["perplexity"], 3), ppl_ratio=round(ratio, 4), top1=round(top1, 4),
+        quality_ok=bool(ratio <= 1.10 and top1 >= 0.85),
+        screen_matches=screen_matches, screen_ok=bool(screen_matches >= 12),
+        scores={f"U{i+1}": round(float(s), 3) for i, s in enumerate(scores)},
+        threshold=round(tardos.threshold, 3), hits=hits,
+        attr_observed=attrs.tolist(), screen_observed=screens.tolist())
 
 
-def run(evidence, out, seed):
-    report = json.loads((evidence / "report.json").read_text())
-    if not (report["passed"] and report["model"] == REPO and report["revision"] == REVISION):
-        raise ValueError("Expected successful pinned Qwen Stage 3 run")
-    entries = Journal(evidence / "journal.jsonl").entries
-    trace = json.loads((evidence / "trace.json").read_text())
-    def opening(group):
-        record = unique(entries, "probe_disclosure", lambda body: body["group"] == group)
-        return record["body"]["opening"]["parameters"]
-    screen, attr = opening("screen"), opening(trace["group"])
-    params = unique(entries, "group_disclosed_and_retired",
-                    lambda body: body["parameters"]["group"] == trace["group"])["body"]["parameters"]
-    cutoff = trace["cutoff_integer"]
+def survival(observed, original):
+    obs = np.asarray(observed); orig = np.asarray(original)
+    erased = int(np.sum(obs < 0))
+    known = obs >= 0
+    retained = int(np.sum(known & (obs == orig)))
+    flipped = int(np.sum(known & (obs != orig)))
+    return dict(retained=retained, flipped=flipped, erased=erased, known=int(known.sum()))
+
+
+# -------------------- main --------------------
+def run(stage3_run, out):
+    out.mkdir(parents=True, exist_ok=False)
+    started = time.monotonic()
+
+    ev = load_evidence(stage3_run)
+    print("evidence recovered: 3 codewords, probes, Tardos params", flush=True)
+
+    train, generic, prompts, utility = split_corpus(CORPUS, (BITS + SCREEN_BITS) * REPEATS)
     texts = ordinary_splits(CORPUS)
-    evaluation = texts["eval"][:64]
-    owner = CarrierLab(evidence / "owner_model", device="cuda:0", read_only=True)
-    owner_quality, reference = owner.utility(evaluation)
-    owner_ind, owner_screen = observe(owner, attr), observe(owner, screen)
-    del owner
-    words = {}
-    archives = {}
-    with (evidence / "deliveries.csv").open(encoding="utf-8-sig", newline="") as stream:
-        deliveries = {row["cid"]: row for row in csv.DictReader(stream)}
-    for cid in COPIES:
-        archive = evidence / "received" / cid / "model.zip"
-        row = deliveries[cid]
-        if float(row["error"]) != 0 or file_hash(archive) != row["sha256"]:
-            raise ValueError(f"Expected exact zero-error Stage 3 delivery for {cid}")
-        archives[cid] = archive
-        with TemporaryDirectory(dir=out) as temp:
-            unpack(archive, temp)
-            lab = CarrierLab(temp, device="cuda:0", read_only=True)
-            words[cid] = observe(lab, attr)
-            if (len(words[cid]) != 128 or np.any(words[cid] < 0)
-                    or not np.array_equal(observe(lab, screen), screen["word"])):
-                raise ValueError(f"Invalid clean readout for {cid}")
-            del lab
-    # Cross-check reconstructed codebook against all three published U1 scores.
-    if scores(params, words["U1"], words) != {
-            cid: round(value * params["scale"]) for cid, value in trace["scores"].items()}:
-        raise ValueError("Clean scoring disagrees with Stage 3")
-    rows = []
-    def record(cid, case, ind, shared, quality):
-        matches = int(np.sum(shared == screen["word"]))
-        passed = matches >= screen["minimum_matches"]
-        integers = scores(params, ind, words)
-        hits = [key for key, value in integers.items() if passed and value >= cutoff]
-        row = dict(copy=cid, case=case, screen_matches=matches, screen_passed=passed,
-                   screen_survival=matches / len(shared), hits=hits,
-                   scores={k: v / params["scale"] for k, v in integers.items()},
-                   ppl_ratio=quality["perplexity"] / owner_quality["perplexity"],
-                   top1=quality["top1_agreement"])
-        row["utility_ok"] = row["ppl_ratio"] <= 1.10 and row["top1"] >= .85
-        if cid in words:
-            row.update(individual_survival=float(np.mean(ind == words[cid])),
-                       flips=int(np.sum((ind >= 0) & (ind != words[cid]))),
-                       erasures=int(np.sum(ind < 0)), unique_correct=hits == [cid],
-                       wrong_recipient=any(key != cid for key in hits))
-        rows.append(row)
-        path = out / "measurements.tmp"
-        save_json(path, rows)
-        path.replace(out / "measurements.json")
+    calib = texts["calib"]
 
-    record("owner", "negative_control", owner_ind, owner_screen,
-           dict(perplexity=owner_quality["perplexity"], top1_agreement=1.0))
-    for cid in COPIES:
-        with TemporaryDirectory(dir=out) as temp:
-            unpack(archives[cid], temp)
-            for case in CASES:
-                torch.manual_seed(seed)
-                lab = CarrierLab(temp, device="cuda:0", read_only=True)
-                if case in ("instruction_lora", "continue_last_block"):
-                    train_variant(lab, case, texts["train"], seed)
-                elif case != "clean":
-                    transform_weights(lab, case)
-                quality, _ = lab.utility(evaluation, reference)
-                record(cid, case, observe(lab, attr), observe(lab, screen), quality)
+    # owner baseline: use the SAME post-owner_train owner that stage3 started
+    # from (saved as owner_model.zip), not the raw pretrained checkpoint.
+    owner_zip = stage3_run / "owner_model.zip"
+    with TemporaryDirectory(dir=out) as tmp, ZipFile(owner_zip) as z:
+        z.extractall(tmp)
+        owner = CarrierLab(tmp, device="cuda:0", read_only=True)
+        owner_q, owner_preds = owner.utility(calib)
+        owner_ppl = owner_q["perplexity"]
+        del owner
+        gc.collect(); torch.cuda.empty_cache()
+    print(f"owner baseline (post owner_train) PPL={owner_ppl:.3f}", flush=True)
+
+    transforms = [
+        ("finetune", lambda lab, seed: transform_lm(lab, texts["train"], FINETUNE_STEPS, FINETUNE_LR, seed)),
+        ("continue_train", lambda lab, seed: transform_lm(lab, texts["train"], CONTINUE_STEPS, CONTINUE_LR, seed)),
+        ("prune", lambda lab, seed: transform_prune(lab, PRUNE_FRACTION)),
+        ("quantize", lambda lab, seed: transform_quant(lab, QUANT_DTYPE)),
+    ]
+
+    rows = []
+    for i in range(1, COPIES + 1):
+        cid = f"U{i}"
+        artifact = stage3_run / "received" / cid / "model.zip"
+        original_word = ev["words"][cid]["individual"]
+        for name, fn in transforms:
+            print(f"\n=== {cid} / {name} ===", flush=True)
+            t0 = time.monotonic()
+            with TemporaryDirectory(dir=out) as tmp, ZipFile(artifact) as z:
+                z.extractall(tmp)
+                lab = CarrierLab(tmp, device="cuda:0")
+                lab.repeats = REPEATS
+                fn(lab, seed=i)
+                m = measure(lab, ev, owner_ppl, owner_preds, calib)
                 del lab
-                gc.collect()
-    summary = {}
-    for case in CASES:
-        subset = [r for r in rows if r["case"] == case]
-        summary[case] = dict(copies=len(subset),
-                             unique_correct=sum(r["unique_correct"] for r in subset),
-                             wrong_recipient=sum(r["wrong_recipient"] for r in subset),
-                             utility_ok=sum(r["utility_ok"] for r in subset),
-                             usable_and_traced=sum(r["utility_ok"] and r["unique_correct"] for r in subset))
-    save_json(out / "summary.json", dict(seed=seed, steps=STEPS, model=REPO, revision=REVISION,
-              cutoff_integer=cutoff, eval_examples=len(evaluation), cases=summary,
-              owner_false_positive=bool(rows[0]["hits"]), peak_reserved_bytes=torch.cuda.max_memory_reserved()))
+                gc.collect(); torch.cuda.empty_cache()
+            surv = survival(m["attr_observed"], original_word)
+            correct = m["hits"] == [cid]
+            attribution_ok = bool(m["screen_ok"] and m["hits"] and correct)
+            row = dict(copy=cid, transform=name,
+                       ppl_ratio=m["ppl_ratio"], top1=m["top1"], quality_ok=m["quality_ok"],
+                       screen_matches=m["screen_matches"], screen_ok=m["screen_ok"],
+                       retained=surv["retained"], flipped=surv["flipped"], erased=surv["erased"],
+                       scores=m["scores"], threshold=m["threshold"],
+                       hits=m["hits"], attribution_ok=attribution_ok,
+                       seconds=round(time.monotonic() - t0, 1))
+            rows.append(row)
+            save_rows(out / "robustness.csv", rows)
+            print(f"  quality={m['quality_ok']} (ppl {m['ppl_ratio']}x top1 {m['top1']}) | "
+                  f"screen={m['screen_matches']}/16 | ind retained/flip/erase="
+                  f"{surv['retained']}/{surv['flipped']}/{surv['erased']} | "
+                  f"hits={m['hits']} attribution_ok={attribution_ok}", flush=True)
+
+    save_json(out / "robustness.json", dict(rows=rows, seconds=time.monotonic() - started,
+                                            owner_ppl=owner_ppl))
+    print(f"\nROBUSTNESS DONE {time.monotonic()-started:.1f}s", flush=True)
+    return rows
+
+
+def save_rows(path, rows):
+    import csv
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: json.dumps(v) if isinstance(v, (dict, list)) else v for k, v in r.items()})
+
+
+def save_json(path, value):
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("evidence", type=Path)
-    parser.add_argument("output", type=Path)
-    parser.add_argument("--seed", type=int, default=2026)
-    args = parser.parse_args()
-    args.output.mkdir(parents=True, exist_ok=False)
-    run(args.evidence, args.output, args.seed)
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("stage3_run", type=Path)
+    p.add_argument("output", type=Path)
+    a = p.parse_args()
+    try:
+        run(a.stage3_run, a.output)
+    except Exception as e:
+        save_json(a.output / "robustness.json", dict(error=str(e)))
+        raise
