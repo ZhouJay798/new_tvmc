@@ -26,7 +26,7 @@ from tvmc.stream_delivery import file_hash
 
 
 def scenarios():
-    single = ["original", "bf16", "int8", "int4",
+    single = ["original", "bf16", "int8", "int4", "int4-g32", "int4-g16", "int4-cal16",
               *[f"prune{p}" for p in (5, 10, 20, 30, 40)],
               *[f"sft-{s}" for s in ("r8", "r16", "1", "3", "7", "full")],
               *[f"data{p}" for p in (1, 5, 10, 25, 100)],
@@ -148,6 +148,25 @@ def summarize(out):
                                           for (c,s,d),n in sorted(matrix.items())])
 
 
+def batch_evidence(run_dir):
+    evidence = json.loads((run_dir / "report.json").read_text())
+    deliveries = {r["cid"]: r for r in evidence["deliveries"]}
+    if not evidence["passed"] or not all(deliveries[c]["error"] == 0 for c in ("U1","U2","U3")):
+        raise ValueError("reference-word reconstruction requires three zero-error deliveries")
+    journal = [json.loads(line) for line in (run_dir / "journal.jsonl").read_text().splitlines()]
+    for i in range(1,4):
+        cid = f"U{i}"
+        hashes = [e["body"]["sha256"] for e in journal
+                  if e["kind"] == "received_file" and e["body"]["cid"] == cid]
+        if hashes != [file_hash(run_dir / "received" / cid / "model.zip")]:
+            raise ValueError(f"received archive mismatch: {cid}")
+    scale, = [e["body"]["parameters"]["scale"] for e in journal if e["kind"] == "group_disclosed_and_retired"]
+    ev = load_evidence(run_dir)
+    if any(not set(w["individual"]) <= {0,1} for w in ev["words"].values()):
+        raise ValueError("reference archive has erasures")
+    return ev, scale
+
+
 def run(args):
     cases = scenarios()
     chosen = args.cases.split(",")
@@ -170,21 +189,7 @@ def run(args):
     cpt = args.cpt.read_text() if args.cpt else "\n".join(splits["train"])
     out = args.output
     run_dir = args.stage3_run
-    evidence = json.loads((run_dir / "report.json").read_text())
-    deliveries = {r["cid"]: r for r in evidence["deliveries"]}
-    if not evidence["passed"] or not all(deliveries[c]["error"] == 0 for c in ("U1","U2","U3")):
-        raise ValueError("reference-word reconstruction requires three zero-error deliveries")
-    journal = [json.loads(line) for line in (run_dir / "journal.jsonl").read_text().splitlines()]
-    for i in range(1,4):
-        cid = f"U{i}"
-        hashes = [e["body"]["sha256"] for e in journal
-                  if e["kind"] == "received_file" and e["body"]["cid"] == cid]
-        if hashes != [file_hash(run_dir / "received" / cid / "model.zip")]:
-            raise ValueError(f"received archive mismatch: {cid}")
-    scale, = [e["body"]["parameters"]["scale"] for e in journal if e["kind"] == "group_disclosed_and_retired"]
-    ev = load_evidence(run_dir)
-    if any(not set(w["individual"]) <= {0,1} for w in ev["words"].values()):
-        raise ValueError("reference archive has erasures")
+    ev, scale = batch_evidence(run_dir)
     seeds = [int(s) for s in args.seeds.split(",")]
     if args.sft_tokens < 1 or len(set(seeds)) != len(seeds):
         raise ValueError("invalid budget or duplicate seed")
@@ -252,6 +257,7 @@ def run(args):
                             counts = survival(obs, word) if word is not None else {}
                             row = dict(source=cid, negative=negative, seed=seed, case=case, step=index,
                                 terminal=index==len(ops), transform=op, training=details, artifacts=artifact,
+                                artifact_bytes=sum(p.stat().st_size for p in dest.iterdir() if p.is_file()),
                                 ppl_ratio=ratio, top1=quality["top1_agreement"], quality_ok=useful,
                                 clean_ppl_ratio=quality["perplexity"]/clean["perplexity"], clean_top1=clean_top1,
                                 counts=counts, survival_rate=counts.get("retained",0)/len(obs) if counts else None,

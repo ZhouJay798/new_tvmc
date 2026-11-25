@@ -20,6 +20,7 @@ Only the LoRA parameters train; the Qwen weights stay frozen. Checkpoints are
 selected on a calibration split that is disjoint from both the probe pool and
 the ordinary training text.
 """
+from contextlib import nullcontext
 import math
 from pathlib import Path
 
@@ -28,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .group_quant import QuantizedWriter, simulate_int4
 from .shared_carriers import CarrierLab
 
 
@@ -41,6 +43,7 @@ class LoRALinear(nn.Module):
             p.requires_grad_(False)
         self.rank = int(rank)
         self.alpha = float(alpha if alpha is not None else rank)
+        self.quant_group = None
         self.scaling = self.alpha / self.rank
         self.A = nn.Parameter(torch.empty(self.rank, base.in_features,
                                           dtype=base.weight.dtype, device=base.weight.device))
@@ -49,6 +52,11 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
 
     def forward(self, x):
+        if self.quant_group is not None:
+            merged = self.base.weight + self.scaling * (self.B @ self.A)
+            fake = simulate_int4(merged, self.quant_group)
+            weight = fake + (merged - merged.detach())
+            return F.linear(x, weight, self.base.bias)
         return self.base(x) + F.linear(F.linear(x, self.A), self.B) * self.scaling
 
     def merge_(self):
@@ -205,7 +213,7 @@ class LoRACarrierLab(CarrierLab):
                     kl_batches=None, kl_max_length=96, eval_every=5,
                     calib_texts=None, owner_ppl=None, owner_preds=None,
                     ppl_budget=1.10, top1_budget=0.85, seed=0,
-                    grad_clip=1.0, log=print):
+                    grad_clip=1.0, log=print, int4_group=None):
         """Train the low-rank write with a joint fingerprint + quality objective.
 
         Returns a history and the selected checkpoint. A checkpoint is retained
@@ -230,31 +238,34 @@ class LoRACarrierLab(CarrierLab):
         rng = np.random.default_rng(seed)
         history = []
         best = None
+        simulator = QuantizedWriter(self, int4_group) if int4_group else None
         for step in range(steps):
             opt.zero_grad(set_to_none=True)
             chosen = rng.choice(bits, size=min(bits_per_batch, len(bits)), replace=False)
             idxs = [i for b in chosen for i in groups[b]]
-            logits = self.readout_logits([probes[i]["text"] for i in idxs])
-            a = torch.tensor([probes[i]["tokens"][0] for i in idxs], device=self.device)
-            b = torch.tensor([probes[i]["tokens"][1] for i in idxs], device=self.device)
-            rows = torch.arange(len(idxs), device=self.device)
-            d = logits[rows, a] - logits[rows, b]
-            sums = d.view(len(chosen), repeats).sum(1)
-            y = torch.tensor(2 * word[chosen] - 1, dtype=torch.float32, device=self.device)
-            margins = y * sums
-            loss_bit = F.relu(margin_target - margins).mean()
-            loss = loss_bit
-            kl_val = 0.0
-            if kl_weight > 0 and kl_batches:
-                batch = kl_batches[step % len(kl_batches)]
-                edited = self.next_token_logits(batch, kl_max_length)
-                owner_logp = batch["owner_logp"].to(self.device)
-                edited_logp = F.log_softmax(edited, dim=-1)
-                kl = (owner_logp.exp() * (owner_logp - edited_logp)).sum(-1).mean()
-                kl = torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
-                loss = loss + kl_weight * kl
-                kl_val = float(kl.detach())
-            loss.backward()
+            # Alternate clean and simulated deployment passes; both use owner KL targets.
+            with simulator.enabled() if simulator and step % 2 else nullcontext():
+                logits = self.readout_logits([probes[i]["text"] for i in idxs])
+                a = torch.tensor([probes[i]["tokens"][0] for i in idxs], device=self.device)
+                b = torch.tensor([probes[i]["tokens"][1] for i in idxs], device=self.device)
+                rows = torch.arange(len(idxs), device=self.device)
+                d = logits[rows, a] - logits[rows, b]
+                sums = d.view(len(chosen), repeats).sum(1)
+                y = torch.tensor(2 * word[chosen] - 1, dtype=torch.float32, device=self.device)
+                margins = y * sums
+                loss_bit = F.relu(margin_target - margins).mean()
+                loss = loss_bit
+                kl_val = 0.0
+                if kl_weight > 0 and kl_batches:
+                    batch = kl_batches[step % len(kl_batches)]
+                    edited = self.next_token_logits(batch, kl_max_length)
+                    owner_logp = batch["owner_logp"].to(self.device)
+                    edited_logp = F.log_softmax(edited, dim=-1)
+                    kl = (owner_logp.exp() * (owner_logp - edited_logp)).sum(-1).mean()
+                    kl = torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0)
+                    loss = loss + kl_weight * kl
+                    kl_val = float(kl.detach())
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(params, grad_clip)
             opt.step()
 
@@ -268,9 +279,21 @@ class LoRACarrierLab(CarrierLab):
                               top1=q["top1_agreement"], error=stats["error"],
                               flips=stats["flips"], erasures=stats["erasures"],
                               margin_median=stats["margin_median"], accepted=bool(ok))
+                priority = (stats["error"],)
+                if simulator:
+                    with simulator.enabled():
+                        iq, _ = self.utility(calib_texts, owner_preds)
+                        istats = self.readout_stats(probes, word, repeats)
+                    iratio = iq["perplexity"] / owner_ppl
+                    ok = (ok and iratio <= ppl_budget and iq["top1_agreement"] >= top1_budget
+                          and istats["error"] <= .02)
+                    record.update(int4_error=istats["error"], int4_ppl_ratio=iratio,
+                                  int4_top1=iq["top1_agreement"], accepted=bool(ok))
+                    priority = (stats["error"] != 0, max(stats["error"], istats["error"]),
+                                -istats["margin_min"])
                 history.append(record)
-                if ok and (best is None or stats["error"] < best["error"]):
-                    best = dict(record)
+                if ok and (best is None or priority < best["priority"]):
+                    best = dict(record, priority=priority)
                     best["state"] = [(ad.A.detach().clone(), ad.B.detach().clone())
                                      for _, ad, _ in self._lora]
                 log(f"step {step+1:>4} | loss_bit={loss_bit.item():.4f} kl={kl_val:.5f} "

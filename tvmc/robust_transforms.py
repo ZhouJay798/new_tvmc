@@ -8,6 +8,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
+from .group_quant import quantize_groups
 from .lora_carrier import LoRALinear
 from .shared_carriers import CarrierLab
 
@@ -21,10 +22,11 @@ class EvaluationModel(CarrierLab):
         self.tokenizer.pad_token = self.tokenizer.eos_token
         packed = path / "packed.json"
         if packed.exists():
-            bits = json.loads(packed.read_text())["bits"]
+            layout = json.loads(packed.read_text())
+            bits = layout["bits"]
             config = AutoConfig.from_pretrained(path, local_files_only=True)
             model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float32)
-            replace_linears(model, bits, initialize=False)
+            replace_linears(model, bits, initialize=False, group_size=layout["group_size"])
             state = torch.load(path / "packed.pt", map_location="cpu", weights_only=True, mmap=True)
             model.load_state_dict(state, assign=True)
             model.tie_weights()
@@ -36,23 +38,24 @@ class EvaluationModel(CarrierLab):
 
 
 class PackedLinear(nn.Module):
-    """Symmetric signed group-wise weights, 64 columns per scale, floating point accumulation."""
-    def __init__(self, linear, bits, initialize):
+    """Symmetric signed group-wise weights, configurable columns per scale, floating point accumulation."""
+    def __init__(self, linear, bits, initialize, group_size, importance=None):
         super().__init__()
         w = linear.weight.detach()
         rows, cols = w.shape
-        if cols % 64:
-            raise ValueError("group size 64 requires divisible input dimension")
+        if group_size not in (16, 32, 64) or cols % group_size:
+            raise ValueError("invalid group size or projection dimension")
+        self.group_size = group_size
         self.bits = bits
         self.bias = linear.bias
-        self.register_buffer("scale", w.new_empty(rows, cols // 64, 1, dtype=torch.float32))
+        self.register_buffer("scale", w.new_empty(rows, cols // group_size, 1, dtype=torch.float32))
         self.register_buffer("codes", w.new_empty(rows, cols if bits == 8 else cols // 2,
                                                  dtype=torch.uint8))
         if initialize:
             limit = (1 << (bits - 1)) - 1
-            grouped = w.float().reshape(rows, -1, 64)
-            self.scale.copy_(grouped.abs().amax(-1, keepdim=True).clamp_min(1e-12) / limit)
-            q = ((grouped / self.scale).round().clamp(-limit, limit) + limit).byte().reshape(rows, cols)
+            levels, scale = quantize_groups(w, bits, group_size, importance)
+            self.scale.copy_(scale)
+            q = (levels + limit).byte().reshape(rows, cols)
             self.codes.copy_(q if bits == 8 else q[:, ::2] | (q[:, 1::2] << 4))
 
     def forward(self, x):
@@ -60,7 +63,7 @@ class PackedLinear(nn.Module):
         if self.bits == 4:
             q = torch.stack((q & 15, q >> 4), dim=-1).flatten(1)
         limit = (1 << (self.bits - 1)) - 1
-        weight = (q.float().reshape(*self.scale.shape[:2], 64)
+        weight = (q.float().reshape(*self.scale.shape[:2], self.group_size)
                   - limit) * self.scale
         return F.linear(x, weight.flatten(1).to(x.dtype), self.bias)
 
@@ -73,19 +76,46 @@ def projections(model):
                     yield parent, name, child
 
 
-def replace_linears(model, bits, initialize):
+def replace_linears(model, bits, initialize, group_size=64, moments=None):
     for parent, name, layer in projections(model):
-        setattr(parent, name, PackedLinear(layer, bits, initialize))
+        setattr(parent, name, PackedLinear(layer, bits, initialize, group_size, moments[layer] if moments else None))
+
+
+@torch.no_grad()
+def calibration_moments(lab):
+    from assets import CORPUS
+    from .lora_carrier import ordinary_splits
+    texts = ordinary_splits(CORPUS)["train"][:32]
+    moments = {}
+    handles = []
+
+    def observe(module, args):
+        activations = args[0].detach().float().reshape(-1, module.in_features)
+        moments[module].add_(activations.square().sum(0))
+
+    try:
+        for _, _, layer in projections(lab.model):
+            moments[layer] = layer.weight.new_zeros(layer.in_features, dtype=torch.float32)
+            handles.append(layer.register_forward_pre_hook(observe))
+        for text in texts:
+            lab.model.model(**lab.tokens(text), use_cache=False)
+    finally:
+        for handle in handles:
+            handle.remove()
+    return moments
 
 
 def save_variant(lab, dest, op):
     dest.mkdir()
-    if op in ("int4", "int8"):
-        bits = int(op[3:])
-        replace_linears(lab.model, bits, initialize=True)
+    if op in ("int4", "int8", "int4-g32", "int4-g16", "int4-cal16"):
+        name, _, size = op.replace("-cal", "-g").partition("-g")
+        bits = int(name[3:])
+        group_size = int(size) if size else 64
+        moments = calibration_moments(lab) if op == "int4-cal16" else None
+        replace_linears(lab.model, bits, initialize=True, group_size=group_size, moments=moments)
         lab.model.config.save_pretrained(dest)
         torch.save(lab.model.state_dict(), dest / "packed.pt")
-        (dest / "packed.json").write_text(json.dumps(dict(bits=bits, group_size=64)))
+        (dest / "packed.json").write_text(json.dumps(dict(bits=bits, group_size=group_size, method=op)))
     else:
         if op == "bf16":
             lab.model.to(torch.bfloat16)

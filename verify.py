@@ -67,11 +67,14 @@ def verify_run(out, anchor, challenge=False):
         opening = unique(journal.entries, "challenge_label_opening", lambda _: True)
         result = unique(journal.entries, "trace_result", lambda _: True)
         screen_commit = unique(journal.entries, "evidence_commitment", lambda b: b["group"] == "screen")
-        expected = [opening["body"]["recipient"]]
+        label = opening["body"]["recipient"]
+        expected = label if isinstance(label, list) else [label]
+        if isinstance(label, list) and (trial["body"].get("case") != "coalition" or len(set(label)) != 2 or len(label) != 2):
+            raise ValueError("Invalid coalition commitment")
         if (not trial["seq"] < screen_commit["seq"] < result["seq"] < opening["seq"]
-                or digest([expected[0], opening["body"]["salt"]]) != trial["body"]["label_commitment"]):
+                or digest([label, opening["body"]["salt"]]) != trial["body"]["label_commitment"]):
             raise ValueError("Challenge label or ordering mismatch")
-        if expected[0] not in (1, 2, 3) or trial["body"]["sha256"] != file_hash(artifact):
+        if not set(expected) <= {1, 2, 3} or trial["body"]["sha256"] != file_hash(artifact):
             raise ValueError("Challenge evidence mismatch")
     checksum = file_hash(artifact)
     screen, seq = disclosed(journal.entries, "screen", checksum, release, registry)
@@ -94,15 +97,15 @@ def verify_run(out, anchor, challenge=False):
         received = out / "received" / cid / "model.zip"
         if recorded["size"] != received.stat().st_size or recorded["sha256"] != file_hash(received):
             raise ValueError(f"Received file differs from the witnessed record for {cid}")
-        expected = dict(cid=cid, ciphertext_hash=manifest["ciphertext_hash"], received=True)
+        expected_receipt = dict(cid=cid, ciphertext_hash=manifest["ciphertext_hash"], received=True)
         if "sha256" in manifest:
-            expected.update(sha256=recorded["sha256"], size=recorded["size"])
-            if any(expected[k] != manifest[k] for k in ("sha256", "size")):
+            expected_receipt.update(sha256=recorded["sha256"], size=recorded["size"])
+            if any(expected_receipt[k] != manifest[k] for k in ("sha256", "size")):
                 raise ValueError("Sender and recipient file mismatch")
-        if (manifest["recipient"] != i or signed["receipt"] != expected
-                or not verify(member_key(registry, i), "receipt", expected, signed["signature"])):
+        if (manifest["recipient"] != i or signed["receipt"] != expected_receipt
+                or not verify(member_key(registry, i), "receipt", expected_receipt, signed["signature"])):
             raise ValueError(f"Invalid signed receipt for {cid}")
-    return dict(verified=trace["recipients"] == expected, recipients=trace["recipients"], screen_matches=count)
+    return dict(proof_verified=True, verified=sorted(trace["recipients"]) == sorted(expected), recipients=trace["recipients"], screen_matches=count)
 
 
 if __name__ == "__main__":

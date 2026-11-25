@@ -50,7 +50,7 @@ PPL_BUDGET = 1.10
 TOP1_BUDGET = 0.85
 
 
-def run(out, challenge=None):
+def run(out, challenge=None, int4_group=None):
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
     ledger = Journal(out / "journal.jsonl")
@@ -114,14 +114,22 @@ def run(out, challenge=None):
         lab.attach_lora(blocks=LORA_BLOCKS, rank=LORA_RANK)
         lab.reset_lora(seed=recipient)
 
+        if int4_group:
+            for block in lab.model.model.layers:
+                for parent in (block.self_attn, block.mlp):
+                    for layer in parent.children():
+                        if isinstance(layer, torch.nn.Linear):
+                            layer.requires_grad_(False)
         result = lab.train_write(
             full_word, probes, repeats=REPEATS,
             margin_target=MARGIN_TARGET, kl_weight=KL_WEIGHT,
             steps=TRAIN_STEPS, bits_per_batch=BITS_PER_BATCH, lr=LR,
             kl_batches=kl_batches,
             calib_texts=texts["calib"], owner_ppl=owner_ppl, owner_preds=owner_preds,
-            ppl_budget=PPL_BUDGET, top1_budget=TOP1_BUDGET, seed=recipient)
+            ppl_budget=PPL_BUDGET, top1_budget=TOP1_BUDGET, seed=recipient, int4_group=int4_group)
 
+        if int4_group:
+            save_json(out / f"int4-calibration-{cid}.json", dict(group=int4_group, history=result["history"]))
         if result["selected"] is None:
             raise ValueError(f"No accepted checkpoint for {cid}")
 
@@ -191,9 +199,17 @@ def run(out, challenge=None):
     recipient = 1
     challenge_quality = True
     if challenge:
-        from stages.stage4_matrix import make_challenge
-        recipient = secrets.randbelow(COPIES) + 1
-        suspect, details = make_challenge(out, recipient, challenge)
+        if challenge.coalition:
+            from stages.stage5_coalition import create_mix, evaluate_archive, owner_reference
+            recipient = sorted(challenge.coalition)
+            suspect = out / "challenge.zip"
+            create_mix(out, suspect, [f"U{i}" for i in recipient], challenge.first_percent)
+            details = evaluate_archive(suspect, *owner_reference(out, out))
+            details.update(case="coalition", first_percent=challenge.first_percent)
+        else:
+            from stages.stage4_matrix import make_challenge
+            recipient = secrets.randbelow(COPIES) + 1
+            suspect, details = make_challenge(out, recipient, challenge)
         challenge_quality = details["quality_ok"]
         blind_salt = secrets.token_hex(32)
         ledger.append("robustness_challenge", dict(label_commitment=digest([recipient, blind_salt]), probe_seed=probe_seed,
@@ -232,7 +248,11 @@ def run(out, challenge=None):
     save_json(out / "trace.json", trace)
     print(f"  scores: { {k: round(v, 3) for k, v in trace['scores'].items()} }", flush=True)
     print(f"  hits: {trace['hits']}  recipients: {trace['recipients']}", flush=True)
-    attribution_ok = trace["recipients"] == [recipient]
+    expected = recipient if isinstance(recipient, list) else [recipient]
+    attribution_ok = sorted(trace["recipients"]) == expected
+    if challenge and challenge.coalition:
+        from stages.stage5_coalition import verdict
+        details.update(verdict(expected, trace["recipients"]))
 
     # ---- Public independent verification ----
     print("\n=== Verification ===", flush=True)
@@ -258,12 +278,12 @@ def run(out, challenge=None):
     all_passed = all(r["passed"] for r in rows)
 
     report = dict(
-        recipients=trace["recipients"], expected=[recipient], challenge_quality=challenge_quality,
+        recipients=trace["recipients"], expected=expected, challenge_quality=challenge_quality,
         attribution_ok=attribution_ok,
         screen_matches=matches, screen_minimum=screening["minimum_matches"],
         screen_passes=screen_passes,
         owner_screen_matches=owner_matches, owner_screen_passes=owner_passes,
-        judge_verified=verified, delivery_audit_verified=audit["verified"],
+        writer_int4_group=int4_group, judge_verified=verified, delivery_audit_verified=audit["verified"],
         all_receipts_exact=all_exact,
         deliveries=[dict(cid=r["cid"], exact=r["exact"], error=r["error"],
                          ppl_ratio=round(r["ppl_ratio"], 4),
@@ -282,7 +302,7 @@ def run(out, challenge=None):
     print(f"  receipts exact:  {all_exact} (3/3)", flush=True)
     print(f"  suspect screen:       {matches}/16 (min 12) {'OK' if screen_passes else 'FAIL'}", flush=True)
     print(f"  owner control:   {owner_matches}/16 {'BLOCKED (good)' if not owner_passes else 'PASSED (BAD)'}", flush=True)
-    print(f"  attribution:     {trace['recipients']} (expect [{recipient}]) {'OK' if attribution_ok else 'FAIL'}", flush=True)
+    print(f"  attribution:     {trace['recipients']} (expect {expected}) {'OK' if attribution_ok else 'FAIL'}", flush=True)
     print(f"  judge_file:      {'PASS' if verified else 'FAIL'}", flush=True)
     return report
 
@@ -290,12 +310,18 @@ def run(out, challenge=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--challenge", metavar="CASE")
+    trial = parser.add_mutually_exclusive_group()
+    trial.add_argument("--challenge", metavar="CASE")
+    trial.add_argument("--coalition", nargs=2, type=int, choices=(1,2,3))
+    parser.add_argument("--first-percent", type=int, default=50, help="share of lower-numbered coalition member")
     parser.add_argument("--sft", type=Path)
     parser.add_argument("--cpt", type=Path)
     parser.add_argument("--sft-tokens", type=int, default=50000)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--int4-aware", type=int, choices=(16, 32, 64), metavar="GROUP")
     args = parser.parse_args()
+    if args.coalition and (len(set(args.coalition)) != 2 or not 0 < args.first_percent < 100):
+        parser.error("invalid coalition or share")
     if args.challenge:
         from stages.stage4_matrix import scenarios
         if args.challenge not in scenarios() or args.sft_tokens < 1:
@@ -305,7 +331,7 @@ if __name__ == "__main__":
     out = args.output
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     try:
-        report = run(out, args if args.challenge else None)
+        report = run(out, args if args.challenge or args.coalition else None, int4_group=args.int4_aware)
     except Exception as error:
         save_json(out / "report.json", dict(passed=False, error=str(error)))
         raise

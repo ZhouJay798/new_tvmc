@@ -52,3 +52,60 @@ python verify.py runs/confirm-c2-001 --challenge --trust-sha256 "$(cat runs/conf
 
 可选出图：在含 matplotlib 的分析环境运行 `python stages/plot_robustness.py runs/scan-combined`。
 工具按目录内已有数据生成强度曲线、组合步骤图及来源与裁决计数矩阵 PNG。部分完成的目录只包含已完成测量。
+
+## INT4 双达标与双人合谋（Qwen2.5-1.5B-Instruct）
+
+在项目根目录、原 CUDA 环境和数据盘内执行。先扫描同一批通过的签收文件，
+同一份留出文本对比 owner 与三个副本的量化前后质量、存活位、分数、阈值及联合通过。
+保持相同的可量化矩阵集合，缩小组会增加 scale 存储开销，比较 measurements.csv 的 artifact_bytes。
+int4 是原始每组 64 列的对称 INT4；g32/g16 缩小分组；cal16 在相同的 16 列组上，
+用独立普通训练切分的前 32 个片段估计输入二阶矩，从 5 个范围中逐组选取加权误差最小的 scale。
+该算法是本项目的校准基线。全部低位条件均需保存整数码、重载后计分。
+
+```bash
+python stages/stage4_matrix.py runs/lora-delivery-001 runs/int4-study-001 \
+  --sources owner,U1,U2,U3 --cases original,int8,int4,int4-g32,int4-g16,int4-cal16
+```
+
+若需要强化写入，在新发行中使用 --int4-aware 16（也支持 32、64）。
+FP32 与模拟 INT4 的训练步交替，均使用位级损失和相对 owner 的 KL 约束；
+模拟时其他投影为量化后的冻结权重，载体投影先合并 LoRA 再量化，并用直通梯度优化。
+校准检查点要求两种精度都满足质量预算、模拟 INT4 误码率不高于 2%，优先保证干净副本零误码，然后最小化最差读回误码。
+在 int4-calibration-U*.json 查看检查点记录。若无合格检查点则停止并保留失败记录。
+模拟器针对对称最大值量化；cal16 的校准裁剪及未知外部量化器需另测。
+以下命令在新批次上用真正打包的 g16 做一次新调查：
+
+```bash
+python stages/stage3_delivery.py runs/confirm-int4-aware-001 --int4-aware 16 --challenge int4-g16
+```
+
+评估未知再量化时也要对新接收文件重跑原始 int4（64 列）条件。stage4_matrix 的终点
+joint_pass 要求质量达标及唯一正确归因；若研究目标还要求位存活率达到给定水平，请在跑前另外声明阈值。
+不同发行批次有不同码字，不应作为同码字配对消融。新实验显存/耗时未经实测。
+
+### 合谋边界
+
+已有合法签收文件可直接跑以下探索实验，无需重新训练。取 U1/U2/U3 全部三种两两组合，
+在相同 owner 和架构上对对应参数做线性混合；percent 为编号较小接收方的权重百分比。
+默认 9 个混合文件，每个文件打包、重载、读回。从全体三个登记候选者中按原筛查与整数阈值输出 hits。
+保存 coalitions.csv 和 summary.json；临时混合文件在测量后清理，CSV 保留文件哈希。
+
+```bash
+python stages/stage5_coalition.py runs/lora-delivery-001 runs/coalition-sweep-001 --percent 25 50 75
+```
+
+严格成功要求命中集合等于真实贡献者集合。分别查看 all_identified、any_identified、innocent_hit、
+missed、recall、screen_matches 及 quality_ok。any_identified 可以与 innocent_hit 同时为真。
+质量达标且完整找回的分母是所有预定混合文件。此扫描使用旧批次已披露探针，仅作离线诊断。
+
+正式复核为每个混合文件建立新发行及新的调查组。如下模拟 U1 与 U2 平均混合，
+保留 challenge.zip，先承诺其摘要及加盐来源标签，筛查放行后门限归因，裁决后打开标签。
+用独立进程检查双方是否都被正确命中且没有 U3。裁决证明有效与完整找回是两项指标；
+核验文件中的 proof_verified 和 verified 分别表示证明通过及结果与预期集合相符。
+筛查拦截则在披露归因探针前终止。U1/U2 是登记副本来源，结果仅涉及混合模型的贡献来源。
+
+```bash
+python stages/stage3_delivery.py runs/confirm-U1-U2-001 --coalition 1 2 --first-percent 50
+```
+
+建议每次仅运行一个进程。旧批次扫描和新批次确认的分母需分别报告。
